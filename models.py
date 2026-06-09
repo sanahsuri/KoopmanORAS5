@@ -2,11 +2,45 @@ import torch
 import torch.nn as nn
 
 
+class KoopmanOperator(nn.Module):
+    """Lusch-style structured K: block-diagonal 2×2 rotation matrices.
+
+    Each pair of latent dims gets eigenvalue  mu * e^(±i*omega)
+    where mu = sigmoid(mu_raw) ∈ (0, 1), guaranteeing stability.
+    """
+
+    def __init__(self, latent_dim: int):
+        super().__init__()
+        assert latent_dim % 2 == 0, "latent_dim must be even for Lusch K"
+        n = latent_dim // 2
+        self.mu_raw = nn.Parameter(torch.zeros(n))          # sigmoid → (0,1)
+        self.omega  = nn.Parameter(torch.randn(n) * 0.01)  # frequency
+
+    def _build(self):
+        mu = torch.sigmoid(self.mu_raw)   # (n,)
+        c  = torch.cos(self.omega)         # (n,)
+        s  = torch.sin(self.omega)         # (n,)
+        # blocks shape: (n, 2, 2)
+        blocks = torch.stack([
+            torch.stack([ mu * c, -mu * s], dim=1),
+            torch.stack([ mu * s,  mu * c], dim=1),
+        ], dim=1)
+        return torch.block_diag(*blocks.unbind(0))  # (latent_dim, latent_dim)
+
+    @property
+    def weight(self):
+        """Full K matrix — used by visualize.py for eigendecomposition."""
+        return self._build()
+
+    def forward(self, z):
+        return z @ self._build().t()  # z: (B, latent_dim)
+
+
 class Encoder(nn.Module):
-    def __init__(self, Y, X, latent_dim, channels=(16, 32, 64)):
+    def __init__(self, Y_pad, X_pad, latent_dim, channels=(16, 32, 64)):
         super().__init__()
         n_pools = len(channels)
-        flat_dim = channels[-1] * (Y // (2 ** n_pools)) * (X // (2 ** n_pools))
+        flat_dim = channels[-1] * (Y_pad // (2 ** n_pools)) * (X_pad // (2 ** n_pools))
 
         layers = []
         in_ch = 1
@@ -22,23 +56,22 @@ class Encoder(nn.Module):
         self.fc = nn.Linear(flat_dim, latent_dim)
 
     def forward(self, x):
-        # x: (B, 1, Y, X)
         h = self.conv(x)
         return self.fc(h.view(h.shape[0], -1))  # (B, latent_dim)
 
 
 class Decoder(nn.Module):
-    def __init__(self, Y, X, latent_dim, channels=(64, 32, 16)):
+    def __init__(self, Y, X, Y_pad, X_pad, latent_dim, channels=(64, 32, 16)):
         super().__init__()
         n_pools = len(channels)
-        self.Yf = Y // (2 ** n_pools)
-        self.Xf = X // (2 ** n_pools)
+        self.Yf = Y_pad // (2 ** n_pools)
+        self.Xf = X_pad // (2 ** n_pools)
         self.Y = Y
         self.X = X
+        self.ch0 = channels[0]
         flat_dim = channels[0] * self.Yf * self.Xf
 
         self.fc = nn.Linear(latent_dim, flat_dim)
-        self.ch0 = channels[0]
 
         layers = []
         in_ch = channels[0]
@@ -55,7 +88,6 @@ class Decoder(nn.Module):
         self.conv = nn.Sequential(*layers)
 
     def forward(self, z):
-        # z: (B, latent_dim)
         B = z.shape[0]
         h = self.fc(z).view(B, self.ch0, self.Yf, self.Xf)
         return self.conv(h)[:, :, :self.Y, :self.X]  # (B, 1, Y, X)
@@ -64,11 +96,19 @@ class Decoder(nn.Module):
 class KoopmanNet(nn.Module):
     def __init__(self, Y, X, latent_dim=128, channels=(16, 32, 64)):
         super().__init__()
-        self.encoder = Encoder(Y, X, latent_dim, channels)
-        self.decoder = Decoder(Y, X, latent_dim, tuple(reversed(channels)))
-        self.K = nn.Linear(latent_dim, latent_dim, bias=False)
+        n_pools = len(channels)
+        factor = 2 ** n_pools
+        Y_pad = ((Y + factor - 1) // factor) * factor  # next multiple of factor
+        X_pad = ((X + factor - 1) // factor) * factor
+        self.pad_y = Y_pad - Y
+        self.pad_x = X_pad - X
+
+        self.encoder = Encoder(Y_pad, X_pad, latent_dim, channels)
+        self.decoder = Decoder(Y, X, Y_pad, X_pad, latent_dim, tuple(reversed(channels)))
+        self.K = KoopmanOperator(latent_dim)
 
     def encode(self, x):
+        x = nn.functional.pad(x, (0, self.pad_x, 0, self.pad_y))
         return self.encoder(x)
 
     def decode(self, z):

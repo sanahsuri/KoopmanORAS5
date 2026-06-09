@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import load_sst, normalize, split, SSTDataset
+from dataset import load_sst, remove_climatology, normalize, split, SSTDataset
 from models import KoopmanNet
 
 
@@ -45,8 +45,10 @@ def run():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'device: {device}')
 
-    arr = load_sst(zarr_path, start=start, end=end)
+    arr, months = load_sst(zarr_path, start=start, end=end)
     print(f'SST array shape: {arr.shape}')
+    arr, clim = remove_climatology(arr, months)
+    print('monthly climatology removed')
     arr, sst_mean, sst_std = normalize(arr)
     print(f'normalised — mean={sst_mean:.4f}, std={sst_std:.4f}')
 
@@ -108,7 +110,8 @@ def run():
 
         if v_loss < best_val:
             best_val = v_loss
-            torch.save({'epoch': epoch, 'model': model.state_dict()},
+            torch.save({'epoch': epoch, 'model': model.state_dict(),
+                        'clim': clim, 'sst_mean': sst_mean, 'sst_std': sst_std},
                        f'{output_dir}/best_model.pt')
 
     print(f'done — best val loss: {best_val:.5f}')

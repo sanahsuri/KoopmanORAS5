@@ -6,7 +6,7 @@ import xarray as xr
 
 class SSTDataset(Dataset):
     def __init__(self, data: np.ndarray, steps: int = 1):
-        # data: (T, Y, X), already normalised
+        # data: (T, Y, X)
         # steps: how many future steps to include per sample
         self.data = data
         self.steps = steps
@@ -28,8 +28,24 @@ def load_sst(zarr_path: str, y_slice=(0, 302), x_slice=(0, 400),
     ds = ds.sortby('time_counter')
     if start or end:
         ds = ds.sel(time_counter=slice(start, end))
-    arr = ds['sosstsst'].values  # (T, Y, X)
-    return arr
+    arr    = ds['sosstsst'].values                   # (T, Y, X)
+    months = ds['time_counter'].dt.month.values      # (T,)  values 1–12
+    return arr, months
+
+
+def remove_climatology(arr: np.ndarray, months: np.ndarray, train_frac: float = 0.8):
+    """Subtract per-month mean computed from training period only."""
+    T = arr.shape[0]
+    t_train = int(T * train_frac)
+    clim = np.zeros((12, arr.shape[1], arr.shape[2]))
+    for m in range(1, 13):
+        idx = np.where(months[:t_train] == m)[0]
+        clim[m - 1] = np.nanmean(arr[:t_train][idx], axis=0)
+    out = arr.copy()
+    for m in range(1, 13):
+        idx = np.where(months == m)[0]
+        out[idx] -= clim[m - 1]
+    return out, clim
 
 
 def normalize(arr: np.ndarray):
