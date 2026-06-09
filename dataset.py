@@ -1,0 +1,48 @@
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+import xarray as xr
+
+
+class SSTDataset(Dataset):
+    def __init__(self, data: np.ndarray, steps: int = 1):
+        # data: (T, Y, X), already normalised
+        # steps: how many future steps to include per sample
+        self.data = data
+        self.steps = steps
+        self.T = data.shape[0]
+
+    def __len__(self):
+        return self.T - self.steps
+
+    def __getitem__(self, idx):
+        x_t   = torch.from_numpy(self.data[idx][None]).float()          # (1, Y, X)
+        x_tp1 = torch.from_numpy(self.data[idx + self.steps][None]).float()  # (1, Y, X)
+        return x_t, x_tp1
+
+
+def load_sst(zarr_path: str, y_slice=(0, 302), x_slice=(0, 400),
+             start: str = None, end: str = None):
+    ds = xr.open_zarr(zarr_path)
+    ds = ds.sel(y=slice(*y_slice), x=slice(*x_slice))
+    ds = ds.sortby('time_counter')
+    if start or end:
+        ds = ds.sel(time_counter=slice(start, end))
+    arr = ds['sosstsst'].values  # (T, Y, X)
+    return arr
+
+
+def normalize(arr: np.ndarray):
+    nan_mask = np.isnan(arr)
+    mean = np.nanmean(arr)
+    std  = np.nanstd(arr)
+    out  = (arr - mean) / (std + 1e-8)
+    out[nan_mask] = 0.0
+    return out, mean, std
+
+
+def split(arr: np.ndarray, train_frac=0.8, val_frac=0.1):
+    T = arr.shape[0]
+    t1 = int(T * train_frac)
+    t2 = t1 + int(T * val_frac)
+    return arr[:t1], arr[t1:t2], arr[t2:]
