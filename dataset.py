@@ -21,7 +21,7 @@ class SSTDataset(Dataset):
         return x_t, x_tp1
 
 
-def load_sst(zarr_path: str, y_slice=(0, 302), x_slice=(0, 400),
+def load_sst(zarr_path: str, y_slice=(0, 682), x_slice=(0, 679),
              start: str = None, end: str = None):
     ds = xr.open_zarr(zarr_path)
     ds = ds.sel(y=slice(*y_slice), x=slice(*x_slice))
