@@ -7,7 +7,7 @@ import xarray as xr
 class SSTDataset(Dataset):
     def __init__(self, data: np.ndarray, steps: int = 1):
         # data: (T, Y, X)
-        # steps: how many future steps to include per sample
+        # steps: rollout length — number of future steps each sample includes
         self.data = data
         self.steps = steps
         self.T = data.shape[0]
@@ -16,14 +16,13 @@ class SSTDataset(Dataset):
         return self.T - self.steps
 
     def __getitem__(self, idx):
-        x_t   = torch.from_numpy(self.data[idx][None]).float()          # (1, Y, X)
-        x_tp1 = torch.from_numpy(self.data[idx + self.steps][None]).float()  # (1, Y, X)
-        return x_t, x_tp1
+        seq = self.data[idx: idx + self.steps + 1]          # (steps+1, Y, X)
+        return torch.from_numpy(seq[:, None]).float()       # (steps+1, 1, Y, X)
 
 
 def load_sst(zarr_path: str, y_slice=(0, 682), x_slice=(0, 679),
              start: str = None, end: str = None):
-    ds = xr.open_zarr(zarr_path)
+    ds = xr.open_zarr(zarr_path, chunks=None)
     ds = ds.sel(y=slice(*y_slice), x=slice(*x_slice))
     ds = ds.sortby('time_counter')
     if start or end:

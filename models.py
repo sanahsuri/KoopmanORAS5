@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
 
 class KoopmanOperator(nn.Module):
@@ -13,8 +14,13 @@ class KoopmanOperator(nn.Module):
         super().__init__()
         assert latent_dim % 2 == 0, "latent_dim must be even for Lusch K"
         n = latent_dim // 2
-        self.mu_raw = nn.Parameter(torch.zeros(n))          # sigmoid → (0,1)
-        self.omega  = nn.Parameter(torch.randn(n) * 0.01)  # frequency
+        # self.mu_raw = nn.Parameter(torch.zeros(n))          # sigmoid → (0,1)
+        # self.omega  = nn.Parameter(torch.randn(n) * 0.01)  # frequency
+        # randomize mu_raw so modes start at different persistence levels
+        # (sigmoid spread roughly over (0.05, 0.95)) instead of all at 0.5
+        self.mu_raw = nn.Parameter(torch.randn(n) * 1.5)
+        # spread omegas across periods 4 months → 20 years (240 months)
+        self.omega  = nn.Parameter(2 * np.pi / torch.linspace(4, 240, n))
 
     def _build(self):
         mu = torch.sigmoid(self.mu_raw)   # (n,)
@@ -119,12 +125,18 @@ class KoopmanNet(nn.Module):
             z = self.K(z)
         return z
 
-    def forward(self, x_t0, x_t1):
-        z_t0  = self.encode(x_t0)
-        z_t1  = self.encode(x_t1)
+    def forward(self, x_seq):
+        # x_seq: (B, S+1, 1, Y, X) — a short rollout window
+        steps = x_seq.shape[1] - 1
+        z_seq = [self.encode(x_seq[:, t]) for t in range(steps + 1)]
 
-        x_rec  = self.decode(z_t0)         # reconstruction
-        z_pred = self.advance(z_t0)        # K z_t0
-        x_pred = self.decode(z_pred)       # one-step prediction
+        x_rec = self.decode(z_seq[0])      # reconstruction of x_t0
 
-        return x_rec, x_pred, z_t0, z_t1, z_pred
+        z_preds, x_preds = [], []
+        z = z_seq[0]
+        for _ in range(steps):
+            z = self.K(z)                  # advance one step
+            z_preds.append(z)
+            x_preds.append(self.decode(z))
+
+        return x_rec, x_preds, z_seq, z_preds
