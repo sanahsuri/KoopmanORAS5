@@ -43,13 +43,13 @@ class KoopmanOperator(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, Y_pad, X_pad, latent_dim, channels=(16, 32, 64)):
+    def __init__(self, Y_pad, X_pad, latent_dim, channels=(16, 32, 64), in_channels=1):
         super().__init__()
         n_pools = len(channels)
         flat_dim = channels[-1] * (Y_pad // (2 ** n_pools)) * (X_pad // (2 ** n_pools))
 
         layers = []
-        in_ch = 1
+        in_ch = in_channels
         for out_ch in channels:
             layers += [
                 nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
@@ -63,11 +63,12 @@ class Encoder(nn.Module):
 
     def forward(self, x):
         h = self.conv(x)
-        return self.fc(h.view(h.shape[0], -1))  # (B, latent_dim)
+        z = self.fc(h.view(h.shape[0], -1))
+        return z
 
 
 class Decoder(nn.Module):
-    def __init__(self, Y, X, Y_pad, X_pad, latent_dim, channels=(64, 32, 16)):
+    def __init__(self, Y, X, Y_pad, X_pad, latent_dim, channels=(64, 32, 16), out_channels=1):
         super().__init__()
         n_pools = len(channels)
         self.Yf = Y_pad // (2 ** n_pools)
@@ -83,13 +84,15 @@ class Decoder(nn.Module):
         in_ch = channels[0]
         for out_ch in channels[1:]:
             layers += [
-                nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2),
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
                 nn.BatchNorm2d(out_ch),
                 nn.ReLU(),
             ]
             in_ch = out_ch
         layers += [
-            nn.ConvTranspose2d(in_ch, 1, kernel_size=2, stride=2),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(in_ch, out_channels, kernel_size=3, padding=1),
         ]
         self.conv = nn.Sequential(*layers)
 
@@ -100,7 +103,7 @@ class Decoder(nn.Module):
 
 
 class KoopmanNet(nn.Module):
-    def __init__(self, Y, X, latent_dim=128, channels=(16, 32, 64)):
+    def __init__(self, Y, X, latent_dim=128, dropout=.3, channels=(16, 32, 64), in_channels=1):
         super().__init__()
         n_pools = len(channels)
         factor = 2 ** n_pools
@@ -109,8 +112,8 @@ class KoopmanNet(nn.Module):
         self.pad_y = Y_pad - Y
         self.pad_x = X_pad - X
 
-        self.encoder = Encoder(Y_pad, X_pad, latent_dim, channels)
-        self.decoder = Decoder(Y, X, Y_pad, X_pad, latent_dim, tuple(reversed(channels)))
+        self.encoder = Encoder(Y_pad, X_pad, latent_dim, channels, in_channels)
+        self.decoder = Decoder(Y, X, Y_pad, X_pad, latent_dim, tuple(reversed(channels)), in_channels)
         self.K = KoopmanOperator(latent_dim)
 
     def encode(self, x):
