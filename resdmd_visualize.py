@@ -118,6 +118,45 @@ def unnorm_diff(x, channel_idx=0):
     return x * std.squeeze()[channel_idx]
 
 
+# PHASE_FIX: helper + all call sites tagged with this marker
+def _peak_loading_ref(V, viz, arr, device):
+    """Physically anchors each mode's phase to the real data at wherever that
+    mode's own decoded pattern is strongest, instead of a fixed channel/
+    location chosen up front. |readout(v)| is phase-invariant (rotating v by
+    e^{i*theta} just rotates readout(v) by the same phase), so each mode's
+    peak-loading (channel, y, x) is well-defined before any phase choice is
+    made -- this is what lets the reference generalize across any number of
+    variables/channels instead of hardcoding VARS[0].
+    Returns ref: (n_modes, T) complex, the real data's time series at each
+    mode's own peak-loading location.
+    """
+    C_readout_c = viz.C_readout.to(torch.complex64).to(device)
+    S = (V.T.to(device).to(torch.complex64) @ C_readout_c.T).view(-1, viz.C, viz.H, viz.W)
+    tmask_t = torch.from_numpy(np.nan_to_num(tmask, nan=0.0)).to(device)  # 0 over land, so land is never picked
+    mag = S.abs() * tmask_t
+    flat_idx = mag.view(mag.shape[0], -1).argmax(dim=1)                   # (n_modes,) peak index per mode
+    c_idx, y_idx, x_idx = np.unravel_index(flat_idx.cpu().numpy(), (viz.C, viz.H, viz.W))
+    ref = torch.from_numpy(arr[:, c_idx, y_idx, x_idx].T).to(torch.complex64)  # (n_modes, T)
+    return ref
+
+
+# PHASE_FIX: helper + all call sites tagged with this marker
+def _pin_mode_phase(eigenvectors, b, ref):
+    """Rotate each eigenvector (and its matching row of b) by the unit-modulus
+    phase that maximizes correlation of Re(b_i(t)) with that mode's own
+    peak-loading reference series ref[i], so a mode's positive phase
+    consistently means "more of the real anomaly at this mode's own peak
+    location" rather than an arbitrary convention that can flip between
+    eig() calls/backends/runs. |b_i(t)| (and hence amplitude) is unaffected
+    -- only the sign/orientation of the decoded spatial pattern changes.
+    """
+    z = (b * ref).sum(dim=1)               # (n_modes,) complex
+    phase = torch.exp(1j * z.angle())
+    eigenvectors = eigenvectors * phase.unsqueeze(0)
+    b = b * phase.conj().unsqueeze(1)
+    return eigenvectors, b
+
+
 model = EDMDDLModel(C, (Y, X), N_DICT, HIDDEN, INCLUDE_STATE, TRAIN_RIDGE, COMPUTE_READOUT).to(DEVICE)
 ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
 model.load_state_dict(ckpt['model'])
@@ -431,6 +470,9 @@ def koopman_modes(viz, arr, device, out_dir, n_modes, batch_size=BATCH_SIZE):
     V = eigenvectors
     Vinv = torch.linalg.inv(V)
     b = Vinv @ Z.T.to(torch.complex64)
+    # PHASE_FIX: pin eig()'s arbitrary per-mode phase to this mode's own peak-loading location
+    ref = _peak_loading_ref(V, viz, arr, device)
+    eigenvectors, b = _pin_mode_phase(eigenvectors, b, ref)
     amplitude = b.abs().std(dim=1)
 
     order = amplitude.argsort(descending=True)
@@ -579,6 +621,9 @@ def koopman_modes_by_residual(viz, arr, device, out_dir, n_modes, batch_size=BAT
     V = eigenvectors
     Vinv = torch.linalg.inv(V)
     b = Vinv @ Z.T.to(torch.complex64)
+    # PHASE_FIX: pin eig()'s arbitrary per-mode phase to this mode's own peak-loading location
+    ref = _peak_loading_ref(V, viz, arr, device)
+    eigenvectors, b = _pin_mode_phase(eigenvectors, b, ref)
     amplitude = b.abs().std(dim=1)
 
     order = residuals.argsort(descending=False)
