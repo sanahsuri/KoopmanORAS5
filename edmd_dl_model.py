@@ -1,13 +1,14 @@
 """
-EDMD-DL model + loss, split into the model(x) -> outputs / loss_fn(outputs, x)
-shape so it can be dropped into an existing generic training loop.
+EDMD-DL model, split into the model(x) -> outputs / loss_fn(outputs, x)
+shape so it can be dropped into an existing generic training loop. Loss
+functions live in losses.py, which imports EDMDDLOutput from here.
 
 model.forward(x_window) does NOT return a reconstruction -- there is no
 decoder. It returns the dictionary embeddings for every snapshot in the
 window and the current EDMD-fit K, computed by a differentiable
 closed-form regression (torch.linalg.solve), so gradients reach the
-dictionary weights via the loss below without any hand-rolled
-alternation between solving for K and updating the dictionary.
+dictionary weights via the loss without any hand-rolled alternation
+between solving for K and updating the dictionary.
 
 K is never a persisted nn.Parameter. It's refit from psi(x) on every
 forward call, so there's no optimizer param group for it and no weight
@@ -19,7 +20,6 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from dataclasses import dataclass
 
 
@@ -81,13 +81,6 @@ class DictionaryNet(nn.Module):
             return torch.cat([state, learned], dim=1)
         return learned
 
-
-# def apply_mask(x: torch.Tensor, ocean_mask: torch.Tensor) -> torch.Tensor:
-#     """Zero land pixels per-channel. x: (B, C, H, W), ocean_mask: (H, W) bool."""
-#     mask = ocean_mask.to(dtype=x.dtype, device=x.device)
-#     return x * mask.unsqueeze(0).unsqueeze(0)
-
-
 def edmd_solve(
     psi_t: torch.Tensor,
     psi_tp1: torch.Tensor,
@@ -98,14 +91,12 @@ def edmd_solve(
     psi(x_{t+1}) ~= K @ psi(x_t) (column-vector convention).
     psi_t, psi_tp1: (M, N), M = however many one-step pairs you pool.
     """
-    #with torch.autocast(device_type=psi_t.device.type, enabled=False):
     psi_t = psi_t.float()
     psi_tp1 = psi_tp1.float()
     N = psi_t.shape[1]
     G = psi_t.T @ psi_t
     A = psi_t.T @ psi_tp1
     G_reg = G + ridge * torch.eye(N, device=psi_t.device, dtype=psi_t.dtype)
-    # print(torch.cuda.memory_allocated(), torch.cuda.memory_reserved())
     K_T = torch.linalg.solve(G_reg, A)
     return K_T.T
 
@@ -116,13 +107,14 @@ def linear_readout_solve(
     ridge: float = 1e-6,
 ) -> torch.Tensor:
     """Closed-form C s.t. x_flat ~= psi @ C^T -- the EDMD-DL 'decoder'."""
-    #with torch.autocast(device_type=psi.device.type, enabled=False):
     psi = psi.float()
     N = psi.shape[1]
     G = psi.T @ psi
     A = psi.T @ x_flat
     G_reg = G + ridge * torch.eye(N, device=psi.device, dtype=psi.dtype)
-    C_T = torch.linalg.solve(G_reg, A)
+    # C_T = torch.linalg.solve(G_reg, A)
+    G_inv = torch.linalg.inv(G_reg)
+    C_T = G_inv @ A
     return C_T.T
 
 
@@ -183,65 +175,3 @@ class EDMDDLModel(nn.Module):
         return EDMDDLOutput(
             psi_all=psi_all, K=K, C_readout=C_readout
         )
-
-# --------------------------------------------------------------------------
-# Loss
-# --------------------------------------------------------------------------
-@dataclass
-class EDMDDLLossConfig:
-    rollout_steps: int = 1     # >1 enables multi-step consistency term below
-    rollout_weight: float = 1.0
-    recon_weight: float = 0.0  # requires model.compute_readout=True
-
-
-def edmd_dl_loss(
-    x_window,
-    output: EDMDDLOutput,
-    cfg: EDMDDLLossConfig,
-) -> Tuple[torch.Tensor, dict]:
-    """
-    output: whatever EDMDDLModel.forward returned for this batch.
-    Returns (loss, logs) -- logs are detached, safe to accumulate/print.
-    """
-    psi_all = output.psi_all
-    K = output.K
-    B, T, N = psi_all.shape
-
-    psi_t = psi_all[:, :-1].reshape(-1, N)
-    psi_tp1 = psi_all[:, 1:].reshape(-1, N)
-    one_step_pred = psi_t @ K.T
-    one_step_loss = F.mse_loss(one_step_pred, psi_tp1)
-
-    rollout_loss = psi_all.new_zeros(())
-    if cfg.rollout_steps > 1:
-        if T < cfg.rollout_steps + 1:
-            raise ValueError(
-                f"window length T={T} too short for rollout_steps={cfg.rollout_steps}"
-            )
-        z = psi_all[:, 0]
-        for step in range(1, cfg.rollout_steps + 1):
-            z = z @ K.T
-            rollout_loss = rollout_loss + F.mse_loss(z, psi_all[:, step])
-        rollout_loss = rollout_loss / cfg.rollout_steps
-
-    loss = one_step_loss + cfg.rollout_weight * rollout_loss
-
-    logs = {
-        "one_step_loss": one_step_loss.detach(),
-        "rollout_loss": rollout_loss.detach() if cfg.rollout_steps > 1 else None,
-        "K": K.detach(),
-    }
-   
-    if output.C_readout is None:
-        raise ValueError(
-            "recon_weight > 0 requires model.compute_readout=True"
-        )
-    x_flat = x_window.reshape(B * T, -1)
-    psi_flat = psi_all.reshape(B * T, N)
-    recon = psi_flat @ output.C_readout.T
-    recon_loss = F.mse_loss(recon, x_flat)
-    if cfg.recon_weight > 0:
-        loss = loss + cfg.recon_weight * recon_loss
-    logs["recon_loss"] = recon_loss.detach()
-
-    return loss, one_step_loss.detach(), rollout_loss.detach(), recon_loss.detach(), K.detach()

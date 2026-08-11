@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import Dataset
 import xarray as xr
 import os
-
+from scipy.ndimage import uniform_filter
 
 class ORASDataset(Dataset):
     def __init__(self, data: np.ndarray, steps: int = 1):
@@ -35,11 +35,11 @@ def load_fields(base_path: str, vars: list, y_slice=(0, 682), x_slice=(0, 679),
                 start: str = None, end: str = None):
     """
     Loads all opa* ensemble members for each variable in vars.
-    
+
     Config pattern:
         zarr_path = /expanse/lustre/projects/ucd245/ssuri/pacific_crop/
         vars = sosstsst,votemper   (comma-separated in config)
-    
+
     Returns arr (T, C, Y, X) where C = n_opas * n_vars, and months (T,)
     """
     import glob, re
@@ -62,14 +62,15 @@ def load_fields(base_path: str, vars: list, y_slice=(0, 682), x_slice=(0, 679),
     return np.stack(arrays, axis=1), months  # (T, C, Y, X)
 
 
-def remove_climatology(arr: np.ndarray, months: np.ndarray, train_frac: float = 0.8):
+def remove_climatology(arr: np.ndarray, months: np.ndarray, train_frac: float = 0.8, clim=None):
     """Subtract per-month mean computed from training period only. Works on (T, C, Y, X)."""
-    T = arr.shape[0]
-    t_train = int(T * train_frac)
-    clim = np.zeros((12, *arr.shape[1:]))
-    for m in range(1, 13):
-        idx = np.where(months[:t_train] == m)[0]
-        clim[m - 1] = np.nanmean(arr[:t_train][idx], axis=0)
+    if clim is None:
+        T = arr.shape[0]
+        t_train = int(T * train_frac)
+        clim = np.zeros((12, *arr.shape[1:]))
+        for m in range(1, 13):
+            idx = np.where(months[:t_train] == m)[0]
+            clim[m - 1] = np.nanmean(arr[:t_train][idx], axis=0)
     out = arr.copy()
     for m in range(1, 13):
         idx = np.where(months == m)[0]
@@ -77,11 +78,13 @@ def remove_climatology(arr: np.ndarray, months: np.ndarray, train_frac: float = 
     return out, clim
 
 
-def normalize(arr: np.ndarray):
+def normalize(arr: np.ndarray, mean=None, std=None):
     """Per-pixel, per-channel normalization. Works on (T, C, Y, X) or (T, Y, X)."""
     nan_mask = np.isnan(arr)
-    mean = np.nanmean(arr, axis=0, keepdims=True)
-    std  = np.nanstd(arr, axis=0, keepdims=True)
+    if mean is None:
+        mean = np.nanmean(arr, axis=0, keepdims=True)
+    if std is None:
+        std  = np.nanstd(arr, axis=0, keepdims=True)
     out  = (arr - mean) / (std + 1e-8)
     out[nan_mask] = 0.0
     return out, mean, std
@@ -92,3 +95,23 @@ def split(arr: np.ndarray, train_frac=0.8, val_frac=0.1):
     t1 = int(T * train_frac)
     t2 = t1 + int(T * val_frac)
     return arr[:t1], arr[t1:t2], arr[t2:]
+
+def smooth(data, size):
+    """
+    data: array with lat/lon as last two dims (..., H, W), NaNs over land
+    size: box window size (int or (size_h, size_w))
+    """
+    size_hw = size if isinstance(size, tuple) else (size, size)
+    lead_dims = data.ndim - 2
+
+    ocean_mask = ~np.isnan(data)
+    data_filled = np.where(ocean_mask, data, 0)
+
+    num = uniform_filter(data_filled, size=(0,) * lead_dims + size_hw, mode='nearest')
+    den = uniform_filter(ocean_mask.astype(data.dtype), size=(0,) * lead_dims + size_hw, mode='nearest')
+
+    with np.errstate(invalid='ignore', divide='ignore'):
+        result = num / den
+
+    result[~ocean_mask] = np.nan
+    return result

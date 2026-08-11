@@ -5,11 +5,12 @@ import torch.nn as nn
 import sys
 import ast
 
-from torch.utils.data import DataLoader
-# from dataset import load_sst, remove_climatology, normalize, split, SSTDataset
-from all_data import load_fields, remove_climatology, normalize, split, ORASDataset
-from models import KoopmanNet
+from collections import defaultdict
 
+from torch.utils.data import DataLoader
+from all_data import load_fields, remove_climatology, normalize, split, ORASDataset, smooth
+from edmd_dl_model import EDMDDLModel
+from losses import get_loss_fn
 
 def get_config(path='config.ini'):
     cfg = configparser.ConfigParser()
@@ -25,18 +26,6 @@ def try_cast(value):
             continue
     return value
 
-def koopman_loss(x_rec, x_seq, x_preds, z_seq, z_preds):
-    steps = len(x_preds)
-    rec_loss  = nn.functional.l1_loss(x_rec, x_seq[:, 0]) + 0.5 * nn.functional.mse_loss(x_rec, x_seq[:, 0])
-    # weight = 1.0 + torch.abs(x_seq[:, 0])  # higher weight where anomaly magnitude is larger
-    # rec_loss = (weight * (x_rec - x_seq[:, 0]).abs()).mean()
-    pred_loss = sum(nn.functional.l1_loss(x_preds[k], x_seq[:, k + 1]) + 1 * nn.functional.mse_loss(x_preds[k], x_seq[:, k + 1])
-                     for k in range(steps)) / steps
-    lin_loss  = sum(nn.functional.mse_loss(z_preds[k], z_seq[k + 1])
-                     for k in range(steps)) / steps
-    return rec_loss, pred_loss, lin_loss
-
-
 def run():
     cfg = get_config()
 
@@ -44,17 +33,19 @@ def run():
     vars      = try_cast(cfg['DATA']['vars'])
     start     = cfg['DATA'].get('start', None)
     end       = cfg['DATA'].get('end', None)
+    smooth_window = cfg.getint('DATA', 'smooth_window')
 
+    n_dict = cfg.getint('MODEL', 'n_dict')
     latent_dim = cfg.getint('MODEL', 'latent_dim')
-    channels   = [int(c) for c in cfg['MODEL']['channels'].split(',')]
-    dropout = cfg.getfloat('MODEL', 'dropout')
+    include_state = cfg.getboolean('MODEL', 'include_state')
+    train_ridge = cfg.getfloat('MODEL', 'train_ridge')
+    compute_readout = cfg.getboolean('MODEL', 'compute_readout')
+
+    loss_fn = get_loss_fn(cfg['LOSS']['loss_type'])
 
     epochs     = cfg.getint('TRAINING', 'epochs')
     lr         = cfg.getfloat('TRAINING', 'lr')
     batch_size = cfg.getint('TRAINING', 'batch_size')
-    w_rec      = cfg.getfloat('TRAINING', 'w_rec')
-    w_pred     = cfg.getfloat('TRAINING', 'w_pred')
-    w_lin      = cfg.getfloat('TRAINING', 'w_lin')
     ckpt_every = cfg.getint('TRAINING', 'checkpoint_every')
     rollout    = cfg.getint('TRAINING', 'rollout_steps', fallback=1)
     output_dir = cfg['OUTPUT']['dir']
@@ -71,109 +62,85 @@ def run():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'device: {device}')
 
-    # arr, months = load_sst(zarr_path, start=start, end=end)
     arr, months = load_fields(zarr_path, vars, start=start, end=end)
     print(f'Data array shape: {arr.shape}')
     arr, clim = remove_climatology(arr, months)
     print('monthly climatology removed')
     arr, mean, std = normalize(arr)
-    #print(f'normalized — mean={sst_mean:.4f}, std={sst_std:.4f}')
+
+    arr = smooth(arr, smooth_window)
 
     train_arr, val_arr, test_arr = split(arr)
-    # train_ds = SSTDataset(train_arr, steps=rollout)
-    # val_ds   = SSTDataset(val_arr, steps=rollout)
     train_ds = ORASDataset(train_arr, steps=rollout)
     val_ds   = ORASDataset(val_arr, steps=rollout)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=1)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=1)
+    # drop_last=True: resdmd_batch_loss needs each batch to contribute >= n_dict
+    # one-step pairs so svdvals(psi_t) returns n_dict values, matching residuals'
+    # length (one per dictionary eigenvalue) -- a partial last batch would violate that.
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=1, drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True)
 
     Y, X = arr.shape[2], arr.shape[3]
     C = arr.shape[1]
-    model = KoopmanNet(Y, X, latent_dim=latent_dim, dropout=dropout, channels=tuple(channels), in_channels=C).to(device)
 
-    # K has very few parameters compared to the encoder/decoder CNNs, so its
-    # gradients are dwarfed by the global grad-norm clip below. Give it its
-    # own param group with a higher LR so mu/omega can actually move.
-    k_params = list(model.K.parameters())
-    other_params = [p for p in model.parameters() if not any(p is kp for kp in k_params)]
-    optimizer = torch.optim.AdamW([
-        {'params': other_params, 'lr': lr, 'weight_decay': 1e-4},
-        {'params': k_params, 'lr': lr * 3, 'weight_decay': 0.0},
-    ])
+    model = EDMDDLModel(C, (Y, X), n_dict, latent_dim, include_state, train_ridge, compute_readout).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)  # only DictionaryNet weights, K isn't a param
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
 
     best_val = float('inf')
-    history = {'epoch': [], 'train': [], 'rec': [], 'pred': [], 'lin': [], 'val': []}
+    history = {'epoch': [], 'train': [], 'val': []}
 
-    prev_mode = 1
     for epoch in range(1, epochs + 1):
         model.train()
-        t_loss = t_rec = t_pred = t_lin = 0.0
-        # if epoch < epochs/2:
-        #         alpha = 0.0
-        #         beta = 0.0
-        #         mode = 1
-        # elif epoch < epochs*3/4:
-        #     alpha = 0.1
-        #     beta = 0.0
-        #     mode = 2
-        # else:
-        alpha = 0.1
-        beta = 1e-3
-        mode = 3
-        if mode != prev_mode:
-            print('Mode', mode)
-            prev_mode = mode
+        t_loss = 0.0
+        t_components = defaultdict(float)
         for x_seq in train_loader:
             x_seq = x_seq.to(device)
-            x_rec, x_preds, z_seq, z_preds = model(x_seq)
-            rec, pred, lin = koopman_loss(
-                x_rec, x_seq, x_preds, z_seq, z_preds)
-
-            loss = rec + alpha * pred + beta * lin
+            output = model(x_seq)
+            loss, log = loss_fn(cfg, x_seq, output)
 
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            t_loss += loss.item(); t_rec += rec.item()
-            t_pred += pred.item(); t_lin += lin.item()
+            t_loss += loss.item()
+            for name, value in log.items():
+                if isinstance(value, torch.Tensor) and value.ndim == 0:
+                    t_components[name] += value.item()
 
         n = len(train_loader)
-        t_loss /= n; t_rec /= n; t_pred /= n; t_lin /= n
+        t_loss /= n
+        for name in t_components:
+            t_components[name] /= n
 
         model.eval()
         v_loss = 0.0
         with torch.no_grad():
             for x_seq in val_loader:
                 x_seq = x_seq.to(device)
-                x_rec, x_preds, z_seq, z_preds = model(x_seq)
-                rec, pred, lin= koopman_loss(
-                    x_rec, x_seq, x_preds, z_seq, z_preds)
-                loss = rec + alpha * pred + beta * lin
+                output = model(x_seq)
+                loss, _ = loss_fn(cfg, x_seq, output)
                 v_loss += loss.item()
         v_loss /= len(val_loader)
         scheduler.step(v_loss)
 
         history['epoch'].append(epoch)
         history['train'].append(t_loss)
-        history['rec'].append(t_rec)
-        history['pred'].append(t_pred)
-        history['lin'].append(t_lin)
         history['val'].append(v_loss)
+        for name, value in t_components.items():
+            history.setdefault(f'train_{name}', []).append(value)
 
         if epoch % 5 == 0:
-            print(f'epoch {epoch:4d} | train {t_loss:.5f} '
-                  f'(rec={t_rec:.5f} pred={t_pred:.5f} lin={t_lin:.5f}) '
-                  f'| val {v_loss:.5f}')
+            comp_str = ' '.join(f'{name}={value:.5f}' for name, value in t_components.items())
+            print(f'epoch {epoch:4d} | train {t_loss:.5f} ({comp_str}) | val {v_loss:.5f}')
 
         if epoch % ckpt_every == 0:
             torch.save({'epoch': epoch, 'model': model.state_dict(),
                         'optimizer': optimizer.state_dict()},
                        f'{output_dir}/runs/ckpt_ep{epoch}.pt')
 
-        #if mode == 3:
         if v_loss < best_val:
             best_val = v_loss
             torch.save({'epoch': epoch, 'model': model.state_dict(),
@@ -189,6 +156,8 @@ def plot_loss_curves(history, out_dir='figs'):
     import matplotlib.pyplot as plt
     os.makedirs(out_dir, exist_ok=True)
 
+    component_keys = [k for k in history if k.startswith('train_')]
+
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
 
     axes[0].plot(history['epoch'], history['train'], label='train')
@@ -198,13 +167,13 @@ def plot_loss_curves(history, out_dir='figs'):
     axes[0].set_title('Train / val loss')
     axes[0].legend()
 
-    axes[1].plot(history['epoch'], history['rec'], label='rec')
-    axes[1].plot(history['epoch'], history['pred'], label='pred')
-    axes[1].plot(history['epoch'], history['lin'], label='lin')
-    axes[1].set_xlabel('epoch'); axes[1].set_ylabel('component loss')
-    axes[1].set_yscale('log')
+    for key in component_keys:
+        label = key[len('train_'):].replace('_', ' ')
+        axes[1].plot(history['epoch'], history[key], label=label)
+    axes[1].set_xlabel('epoch'); axes[1].set_ylabel('component value')
     axes[1].set_title('Train loss components')
-    axes[1].legend()
+    if component_keys:
+        axes[1].legend()
 
     plt.tight_layout()
     plt.savefig(f'{out_dir}/figs/loss_curves.png', dpi=150, bbox_inches='tight')
