@@ -33,13 +33,19 @@ def run():
     vars      = try_cast(cfg['DATA']['vars'])
     start     = cfg['DATA'].get('start', None)
     end       = cfg['DATA'].get('end', None)
+    y_slice   = try_cast(cfg['DATA']['y_slice']) if 'y_slice' in cfg['DATA'] else None
+    x_slice   = try_cast(cfg['DATA']['x_slice']) if 'x_slice' in cfg['DATA'] else None
     smooth_window = cfg.getint('DATA', 'smooth_window')
+    train_frac = cfg.getfloat('DATA', 'train_frac', fallback=0.8)
+    val_frac   = cfg.getfloat('DATA', 'val_frac', fallback=0.1)
 
     n_dict = cfg.getint('MODEL', 'n_dict')
     latent_dim = cfg.getint('MODEL', 'latent_dim')
     include_state = cfg.getboolean('MODEL', 'include_state')
     train_ridge = cfg.getfloat('MODEL', 'train_ridge')
     compute_readout = cfg.getboolean('MODEL', 'compute_readout')
+    lookback = cfg.getint('MODEL', 'lookback', fallback=1)
+    depth = cfg.getint('MODEL', 'depth', fallback=3)
 
     loss_fn = get_loss_fn(cfg['LOSS']['loss_type'])
 
@@ -62,28 +68,37 @@ def run():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'device: {device}')
 
-    arr, months = load_fields(zarr_path, vars, start=start, end=end)
+    arr, months = load_fields(zarr_path, vars, y_slice=y_slice, x_slice=x_slice, start=start, end=end)
     print(f'Data array shape: {arr.shape}')
-    arr, clim = remove_climatology(arr, months)
+    # climatology and normalization stats both come from the training months only
+    n_train = int(arr.shape[0] * train_frac)
+    arr, clim = remove_climatology(arr, months, train_frac=train_frac)
     print('monthly climatology removed')
-    arr, mean, std = normalize(arr)
+    arr, mean, std = normalize(arr, n_fit=n_train)
 
     arr = smooth(arr, smooth_window)
 
-    train_arr, val_arr, test_arr = split(arr)
-    train_ds = ORASDataset(train_arr, steps=rollout)
-    val_ds   = ORASDataset(val_arr, steps=rollout)
+    train_arr, val_arr, test_arr = split(arr, train_frac, val_frac)
+    print(f'split: {len(train_arr)} train / {len(val_arr)} val / {len(test_arr)} test months')
+    train_ds = ORASDataset(train_arr, steps=rollout, lookback=lookback)
+    val_ds   = ORASDataset(val_arr, steps=rollout, lookback=lookback)
 
-    # drop_last=True: resdmd_batch_loss needs each batch to contribute >= n_dict
-    # one-step pairs so svdvals(psi_t) returns n_dict values, matching residuals'
-    # length (one per dictionary eigenvalue) -- a partial last batch would violate that.
+    # val's own batch size is capped at len(val_ds) rather than reusing `batch_size`
+    # directly: val is a small, fixed-size split (e.g. 40 windows from a 10% holdout),
+    # so a train-side batch_size experiment larger than that (e.g. 48, tried when
+    # n_dict=64 needed more samples per batch for conditioning) would otherwise make
+    # drop_last=True zero out val_loader entirely -- floor(40/48)=0 batches -- and
+    # len(val_loader)==0 crashes the v_loss averaging below with a ZeroDivisionError.
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=1, drop_last=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True)
+    val_batch_size = min(batch_size, len(val_ds))
+    val_loader   = DataLoader(val_ds,   batch_size=val_batch_size, shuffle=False, num_workers=1, drop_last=True)
 
     Y, X = arr.shape[2], arr.shape[3]
     C = arr.shape[1]
 
-    model = EDMDDLModel(C, (Y, X), n_dict, latent_dim, include_state, train_ridge, compute_readout).to(device)
+    model = EDMDDLModel(C, (Y, X), n_dict, latent_dim, include_state, train_ridge, compute_readout, lookback=lookback, depth=depth).to(device)
+    print(f'DictionaryNet: depth={depth} width={latent_dim} '
+          f'params={sum(p.numel() for p in model.parameters()):,}')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)  # only DictionaryNet weights, K isn't a param
 

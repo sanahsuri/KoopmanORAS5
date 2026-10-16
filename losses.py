@@ -3,60 +3,86 @@ Loss functions for EDMD-DL training, plus the config-driven loss_type
 dispatch used by train.py.
 """
 
+import ast
+
 import torch
 import torch.nn.functional as F
 
-from edmd_dl_model import EDMDDLOutput
+from edmd_dl_model import EDMDDLOutput, edmd_solve
 
 
 # --------------------------------------------------------------------------
-# EDMD-DL: one-step / rollout / reconstruction loss
+# EDMD-DL: one-shot multi-lag prediction + autoencoder-style reconstruction
 # --------------------------------------------------------------------------
 def edmd_dl_loss(
-    x_window,
     output: EDMDDLOutput,
-    rollout_steps, rollout_weight
+    lags, ridge, psi_weight=1.0, recon_weight=1.0, forecast_weight=1.0,
 ):
     """
-    output: whatever EDMDDLModel.forward returned for this batch.
+    output: whatever EDMDDLModel.forward returned for this batch. Its T
+    (window length) must exceed max(lags).
+
+    Three terms, all sharing the same dictionary/C_readout:
+      - psi_loss: one-shot lag-N Koopman prediction error in dictionary
+        space, averaged over `lags` (see forecast_loss for how each
+        one-shot operator is fit).
+      - recon_loss: plain autoencoder-style reconstruction -- psi_all
+        decoded through C_readout back to physical space, compared to the
+        *same* frame it was encoded from (every frame in the window, not
+        a prediction). This is what makes C_readout/psi capable of
+        representing the input state at all.
+      - forecast_loss: physical-space error of each one-shot lag's
+        *predicted* frame (psi_0 advanced by K_lag, then decoded),
+        compared against the true frame `lag` steps out.
+
     Returns (loss, logs) -- logs are detached, safe to accumulate/print.
     """
     psi_all = output.psi_all
-    K = output.K
+    C_readout = output.C_readout
+    if C_readout is None:
+        raise ValueError("edmd_dl_loss needs C_readout -- set MODEL.compute_readout = True")
     B, T, N = psi_all.shape
 
-    psi_t = psi_all[:, :-1].reshape(-1, N)
-    psi_tp1 = psi_all[:, 1:].reshape(-1, N)
-    one_step_pred = psi_t @ K.T
-    one_step_loss = F.mse_loss(one_step_pred, psi_tp1)
+    max_lag = max(lags)
+    if T <= max_lag:
+        raise ValueError(f"window length T={T} too short for lags={lags} (need T > {max_lag})")
 
-    rollout_loss = psi_all.new_zeros(())
-    if rollout_steps > 1:
-        if T < rollout_steps + 1:
-            raise ValueError(
-                f"window length T={T} too short for rollout_steps={rollout_steps}"
-            )
-        z = psi_all[:, 0]
-        for step in range(1, rollout_steps + 1):
-            z = z @ K.T
-            rollout_loss += F.mse_loss(z, psi_all[:, step])
-        rollout_loss = rollout_loss / rollout_steps
+    x_flat = output.x_target.reshape(B, T, -1)
+    psi_0 = psi_all[:, 0]
 
-    loss = one_step_loss + rollout_weight * rollout_loss
+    # -- autoencoder-style reconstruction: every frame from its own psi --
+    recon_pred = psi_all.reshape(B * T, N) @ C_readout.T
+    recon_loss = F.mse_loss(recon_pred, x_flat.reshape(B * T, -1))
 
-    logs = {
-        "one_step_loss": one_step_loss.detach(),
-        "rollout_loss": rollout_loss.detach() if rollout_steps > 1 else None,
-        "K": K.detach(),
-    }
+    # -- one-shot multi-lag prediction, in psi space and (decoded) state space --
+    psi_loss = psi_all.new_zeros(())
+    forecast_loss = psi_all.new_zeros(())
+    logs = {}
+    for lag in lags:
+        psi_t = psi_all[:, :-lag].reshape(-1, N)
+        psi_tp1 = psi_all[:, lag:].reshape(-1, N)
+        K_lag = edmd_solve(psi_t, psi_tp1, ridge=ridge)  # one-shot lag-N fit
 
-    x_flat = x_window.reshape(B * T, -1)
-    psi_flat = psi_all.reshape(B * T, N)
-    recon = psi_flat @ output.C_readout.T
-    recon_loss = F.mse_loss(recon, x_flat)
-    # if recon_weight > 0:
-    #     loss = loss + recon_weight * recon_loss
+        z = psi_0 @ K_lag.T
+        psi_lag_loss = F.mse_loss(z, psi_all[:, lag])
+        psi_loss = psi_loss + psi_lag_loss
+
+        x_pred = z @ C_readout.T
+        forecast_lag_loss = F.mse_loss(x_pred, x_flat[:, lag])
+        forecast_loss = forecast_loss + forecast_lag_loss
+
+        logs[f"psi_loss_lag{lag}"] = psi_lag_loss.detach()
+        logs[f"forecast_loss_lag{lag}"] = forecast_lag_loss.detach()
+
+    psi_loss = psi_loss / len(lags)
+    forecast_loss = forecast_loss / len(lags)
+
+    loss = psi_weight * psi_loss + recon_weight * recon_loss + forecast_weight * forecast_loss
+
+    logs["psi_loss"] = psi_loss.detach()
     logs["recon_loss"] = recon_loss.detach()
+    logs["forecast_loss"] = forecast_loss.detach()
+    logs["K"] = output.K.detach()
 
     return loss, logs
 
@@ -164,31 +190,38 @@ def resdmd_compute_loss(
 
     return (1 / N) * torch.sum(residuals * residuals) + penalty_coef * cond_penalty
 
-
 def resdmd_batch_loss(
     output: EDMDDLOutput,
     eps: float = 1e-8,
     loss_threshold: float = 10.0,
     use_cond_penalty: bool = True,
     penalty_coef: float = 1.0,
+    lag: int = 1,
 ):
     """
     Second training objective, standalone from edmd_dl_loss: directly
     minimizes the ResDMD spectral residuals of output.K's eigenpairs,
-    computed from the same one-step pairs pooled to fit K (see
-    resdmd_residuals above), guarded by resdmd_compute_loss's
-    condition-number penalty on Psi_X.
+    computed from `lag`-step pairs pooled to fit K (see resdmd_residuals
+    above), guarded by resdmd_compute_loss's condition-number penalty on
+    Psi_X. lag=1 (default) is the original one-step-ahead operator; lag>1
+    fits K as a lag-step transition operator instead, e.g. lag=6 on
+    monthly data targets 6-month dynamics directly rather than deriving
+    them by iterating a 1-step K.
 
-    Requires psi_t to have at least N = psi_all.shape[-1] one-step pairs
+    Requires psi_t to have at least N = psi_all.shape[-1] pairs
     (drop_last=True in the DataLoader) so svdvals(psi_t) returns N values,
-    matching residuals' length.
+    matching residuals' length, and the window length T must exceed lag.
     """
     psi_all = output.psi_all
     K = output.K
     N = psi_all.shape[-1]
+    T = psi_all.shape[1]
 
-    psi_t = psi_all[:, :-1].reshape(-1, N).float()
-    psi_tp1 = psi_all[:, 1:].reshape(-1, N).float()
+    if T <= lag:
+        raise ValueError(f"window length T={T} too short for lag={lag}")
+
+    psi_t = psi_all[:, :-lag].reshape(-1, N).float()
+    psi_tp1 = psi_all[:, lag:].reshape(-1, N).float()
 
     G = psi_t.T @ psi_t
     A = psi_t.T @ psi_tp1
@@ -220,8 +253,12 @@ def resdmd_batch_loss(
 # --------------------------------------------------------------------------
 def _edmd_dl_loss(cfg, x_seq, output):
     return edmd_dl_loss(
-        x_seq, output,
-        cfg.getint('LOSS', 'rollout_steps'), cfg.getfloat('LOSS', 'rollout_weight'),
+        output,
+        ast.literal_eval(cfg.get('LOSS', 'oneshot_lags', fallback='[1]')),
+        cfg.getfloat('MODEL', 'train_ridge'),
+        cfg.getfloat('LOSS', 'psi_weight', fallback=1.0),
+        cfg.getfloat('LOSS', 'recon_weight', fallback=1.0),
+        cfg.getfloat('LOSS', 'forecast_weight', fallback=1.0),
     )
 
 def _resdmd_batch_loss(cfg, x_seq, output):
@@ -231,13 +268,15 @@ def _resdmd_batch_loss(cfg, x_seq, output):
         loss_threshold=cfg.getfloat('LOSS', 'resdmd_loss_threshold', fallback=10.0),
         use_cond_penalty=cfg.getboolean('LOSS', 'resdmd_use_cond_penalty', fallback=True),
         penalty_coef=cfg.getfloat('LOSS', 'resdmd_penalty_coef', fallback=1.0),
+        lag=cfg.getint('LOSS', 'resdmd_lag', fallback=1),
     )
 
 def _combined_loss(cfg, x_seq, output):
-    """edmd_dl_loss (one-step + rollout, logged recon) plus resdmd_weight
-    times resdmd_batch_loss (spectral residual penalty), both computed off
-    the same forward-pass output. Logs from both are merged; no key
-    collisions since resdmd_batch_loss's keys are all resdmd_-prefixed."""
+    """edmd_dl_loss (one-shot multi-lag prediction + reconstruction) plus
+    resdmd_weight times resdmd_batch_loss (spectral residual penalty), both
+    computed off the same forward-pass output. Logs from both are merged;
+    no key collisions since resdmd_batch_loss's keys are all
+    resdmd_-prefixed."""
     edmd_loss, edmd_logs = _edmd_dl_loss(cfg, x_seq, output)
     resdmd_weight = cfg.getfloat('LOSS', 'resdmd_weight', fallback=1.0)
     resdmd_loss, resdmd_logs = _resdmd_batch_loss(cfg, x_seq, output)

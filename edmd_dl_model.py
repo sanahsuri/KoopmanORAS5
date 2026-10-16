@@ -45,20 +45,22 @@ class DictionaryNet(nn.Module):
         n_dict: int,
         hidden_channels: int = 64,
         include_state: bool = True,
+        state_channels: Optional[int] = None,
+        depth: int = 3
     ):
         super().__init__()
         H, W = grid_hw
         self.include_state = include_state
-        self.state_dim = in_channels * H * W
+        self.state_channels = in_channels if state_channels is None else state_channels
+        self.state_dim = self.state_channels * H * W
 
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1, stride=2),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1, stride=2),
-            nn.GELU(),
-        )
+
+        layers = []
+        for i in range(depth):
+            layers += [nn.Conv2d(in_channels if i == 0 else hidden_channels, hidden_channels,
+                                    3, padding=1, stride=1 if i == 0 else 2),
+                        nn.GELU()]
+        self.conv = nn.Sequential(*layers)
         with torch.no_grad():
             dummy = torch.zeros(1, in_channels, H, W)
             feat_dim = self.conv(dummy).flatten(1).shape[1]
@@ -73,11 +75,12 @@ class DictionaryNet(nn.Module):
         self.n_dict = n_dict
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, C, H, W) masked physical field -> psi(x): (B, n_dict)"""
+        """x: (B, in_channels, H, W) -- in_channels = C * lookback, most recent frame
+        last -> psi(x): (B, n_dict)"""
         feat = self.conv(x).flatten(1)
         learned = self.readout(feat)
         if self.include_state:
-            state = x.flatten(1)
+            state = x[:, -self.state_channels:].flatten(1)  # most recent frame only
             return torch.cat([state, learned], dim=1)
         return learned
 
@@ -98,6 +101,8 @@ def edmd_solve(
     A = psi_t.T @ psi_tp1
     G_reg = G + ridge * torch.eye(N, device=psi_t.device, dtype=psi_t.dtype)
     K_T = torch.linalg.solve(G_reg, A)
+    # G_inv = torch.linalg.inv(G_reg)
+    # K_T = G_inv @ A
     return K_T.T
 
 
@@ -105,16 +110,31 @@ def linear_readout_solve(
     psi: torch.Tensor,
     x_flat: torch.Tensor,
     ridge: float = 1e-6,
+    chunk_size: int = 100_000,
 ) -> torch.Tensor:
-    """Closed-form C s.t. x_flat ~= psi @ C^T -- the EDMD-DL 'decoder'."""
+    """Closed-form C s.t. x_flat ~= psi @ C^T -- the EDMD-DL 'decoder'.
+
+    torch.linalg.solve(G_reg, A) hits a reproducible CUBLAS_STATUS_INTERNAL_ERROR
+    in cublasSgetrsBatched when N (dict size) is small (<=8, confirmed via an
+    isolated repro against random data) and A's column count (state_dim, in the
+    millions) is huge. Solving the identical system in column-chunks avoids that
+    pathological (tiny N, huge nrhs) shape without changing the math -- each
+    chunk is the same torch.linalg.solve call, just on a narrower slice of A.
+    """
     psi = psi.float()
     N = psi.shape[1]
     G = psi.T @ psi
     A = psi.T @ x_flat
     G_reg = G + ridge * torch.eye(N, device=psi.device, dtype=psi.dtype)
-    # C_T = torch.linalg.solve(G_reg, A)
-    G_inv = torch.linalg.inv(G_reg)
-    C_T = G_inv @ A
+    if A.shape[1] > chunk_size:
+        C_T = torch.cat(
+            [torch.linalg.solve(G_reg, A[:, i:i + chunk_size]) for i in range(0, A.shape[1], chunk_size)],
+            dim=1,
+        )
+    else:
+        C_T = torch.linalg.solve(G_reg, A)
+    # G_inv = torch.linalg.inv(G_reg)
+    # C_T = G_inv @ A
     return C_T.T
 
 
@@ -125,6 +145,7 @@ def linear_readout_solve(
 class EDMDDLOutput:
     psi_all: torch.Tensor          # (B, T, N)
     K: torch.Tensor                # (N, N)
+    x_target: torch.Tensor         # (B, T, C, H, W) -- physical frame each psi_all[:,t] represents
     C_readout: Optional[torch.Tensor] = None  # (state_dim, N), only if requested
 
 
@@ -145,21 +166,47 @@ class EDMDDLModel(nn.Module):
         include_state: bool = True,
         ridge: float = 1e-6,
         compute_readout: bool = False,
+        lookback: int = 1,
+        depth: int = 3,
+        micro_batch: int = 0,
     ):
         super().__init__()
+        self.lookback = lookback
+        # windows per dictionary call in lift(); 0 = whole batch at once. Only
+        # changes peak activation memory, never the result.
+        self.micro_batch = micro_batch
         self.dictionary = DictionaryNet(
-            in_channels, grid_hw, n_dict, hidden_channels, include_state
+            in_channels * lookback, grid_hw, n_dict, hidden_channels, include_state,
+            state_channels=in_channels, depth=depth
         )
         self.ridge = ridge
         self.compute_readout = compute_readout
 
-    def forward(self, x_window: torch.Tensor) -> EDMDDLOutput:
-        """x_window: (B, T, C, H, W), T >= 2."""
-        B, T, C, H, W = x_window.shape
+    def lift(self, x_window: torch.Tensor) -> torch.Tensor:
+        """x_window: (B, L, C, H, W) -> psi_all: (B, T, N), T = L - lookback + 1.
+        Runs the dictionary micro_batch windows at a time (each window's psi
+        depends only on that window, so chunking doesn't change the result)."""
+        chunk = self.micro_batch or x_window.shape[0]
+        return torch.cat([self._lift(x_window[i:i + chunk]) for i in range(0, x_window.shape[0], chunk)])
 
-        psi_all = torch.stack(
-            [self.dictionary(x_window[:, t]) for t in range(T)], dim=1
+    def _lift(self, x_window: torch.Tensor) -> torch.Tensor:
+        B, L, C, H, W = x_window.shape
+        T = L - self.lookback + 1  # = rollout + 1
+        return torch.stack(
+            [self.dictionary(x_window[:, t:t + self.lookback].reshape(B, -1, H, W))
+             for t in range(T)], dim=1
         )  # (B, T, N)
+
+    def forward(self, x_window: torch.Tensor) -> EDMDDLOutput:
+        """x_window: (B, L, C, H, W), L = lookback + rollout."""
+        return self.fit(self.lift(x_window), x_window)
+
+    def fit(self, psi_all: torch.Tensor, x_window: torch.Tensor) -> EDMDDLOutput:
+        """K and C_readout solved over the whole batch from already-lifted
+        psi_all -- the only step that couples windows. See train_step() in
+        train.py for why lifting and fitting are separable."""
+        B, T = psi_all.shape[:2]
+        x_target = x_window[:, self.lookback - 1: self.lookback - 1 + T]  # (B, T, C, H, W)
 
         psi_t = psi_all[:, :-1].reshape(-1, psi_all.shape[-1]).float()
         psi_tp1 = psi_all[:, 1:].reshape(-1, psi_all.shape[-1]).float()
@@ -168,10 +215,10 @@ class EDMDDLModel(nn.Module):
 
         C_readout = None
         if self.compute_readout:
-            x_flat = x_window.reshape(B * T, -1)
+            x_flat = x_target.reshape(B * T, -1)
             psi_flat = psi_all.reshape(B * T, -1)
             C_readout = linear_readout_solve(psi_flat, x_flat, ridge=self.ridge)
 
         return EDMDDLOutput(
-            psi_all=psi_all, K=K, C_readout=C_readout
+            psi_all=psi_all, K=K, x_target=x_target, C_readout=C_readout
         )
