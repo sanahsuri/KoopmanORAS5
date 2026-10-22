@@ -398,8 +398,9 @@ OTHER = '#b5b4ad'
 nG = len(GNAMES)
 ncol = 2
 nrow = (nG + 1) // ncol
-fig, axes = plt.subplots(nrow, ncol, figsize=(8.2 * ncol, 0.42 * len(RN) * nrow + 1.6 * nrow), squeeze=False,
+fig, axes = plt.subplots(nrow, ncol, figsize=(9.5 * ncol, 0.42 * len(RN) * nrow + 2.2 * nrow), squeeze=False,
                          facecolor='white')
+fig.subplots_adjust(wspace=0.42, hspace=0.62, top=0.95)
 for g, ax in enumerate(axes.flat):
     if g >= nG:
         ax.axis('off'); continue
@@ -422,9 +423,9 @@ for g, ax in enumerate(axes.flat):
 cb = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.5, pad=0.01)
 cb.set_label('log2(local share / global share)', color=INK2); cb.ax.tick_params(colors=INK2, labelsize=8)
 cb.set_ticks([-2, -1, 0, 1, 2]); cb.set_ticklabels(['÷4', '÷2', 'same', '×2', '×4'])
-fig.suptitle(f'N={SIZE} {LOSS}: where each mode group matters more (red) or less (blue) than in the whole model; '
-             f'cell text = seed-mean share of mode energy (%), * = outside the random-box/window null 95% range, '
-             f'† = window shorter than the period', fontsize=10.5, color=INK, x=0.01, ha='left')
+fig.suptitle(f'N={SIZE} {LOSS}: where each mode group matters more (red) or less (blue) than in the whole model\n'
+             f'cell text = seed-mean share of mode energy (%); * = outside the random-box/window null 95% range; '
+             f'† = window shorter than the period', fontsize=10.5, color=INK, x=0.06, y=0.985, ha='left')
 fig.savefig(f'{RES}/share_heatmaps.png', dpi=130, bbox_inches='tight', facecolor='white')
 plt.close(fig)
 
