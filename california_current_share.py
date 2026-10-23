@@ -33,17 +33,8 @@ z = np.load(f'{RES}/regional_share.npz')
 meta = json.load(open(f'{RES}/regional_share.json'))
 RN, WN, GNAMES = list(z['regions']), list(z['windows']), list(z['groups'])
 share, pct = z['share'], z['pct']                                  # (runs, R, W, G), (R, W, G)
-# QB-ENSO + LF-ENSO -> one 'ENSO' group (in QB's slot): sum of the two groups' energies, so the bars still sum to
-# 100%; their mutual cross term is not in the npz and stays out, as for every other pair. No null for the merged group.
-qi = next(g for g, n in enumerate(GNAMES) if 'QB-ENSO' in n)
-li = next(g for g, n in enumerate(GNAMES) if 'LF-ENSO' in n)
-share = share.copy(); share[..., qi] += share[..., li]
-pct = pct.copy(); pct[..., qi] = np.nan
-keep = [g for g in range(len(GNAMES)) if g != li]
-per = lambda n: n.split('(')[-1].split(' yr')[0]
-GNAMES[qi] = f"{GNAMES[qi].split(' ')[0]}+{GNAMES[li].split(' ')[0]} ENSO ({per(GNAMES[qi])} + {per(GNAMES[li])} yr)"
-GNAMES = [GNAMES[g] for g in keep]
-share, pct = share[..., keep], pct[..., keep]
+# both ENSO groups shown separately, labelled plain 'ENSO' (no QB/LF prefix)
+GNAMES = [n.replace('QB-ENSO', 'ENSO').replace('LF-ENSO', 'ENSO') for n in GNAMES]
 sh_m = share.mean(0)
 ri = RN.index(REGION)
 (la0, la1), (lo0, lo1) = meta['regions'][REGION]
